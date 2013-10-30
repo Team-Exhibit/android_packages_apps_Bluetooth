@@ -20,6 +20,7 @@ import android.app.Service;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothProfile;
+import android.bluetooth.BluetoothUuid;
 import android.bluetooth.IBluetoothGatt;
 import android.bluetooth.IBluetoothGattCallback;
 import android.bluetooth.IBluetoothGattServerCallback;
@@ -30,6 +31,10 @@ import android.os.ParcelUuid;
 import android.os.RemoteException;
 import android.util.Log;
 
+import com.android.bluetooth.btservice.ProfileService;
+
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -39,7 +44,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
-import com.android.bluetooth.LeScanRequestArbitrator;
 import com.android.bluetooth.btservice.ProfileService;
 import com.android.bluetooth.btservice.ProfileService.IProfileServiceBinder;
 
@@ -51,7 +55,30 @@ import com.android.bluetooth.btservice.ProfileService.IProfileServiceBinder;
 public class GattService extends ProfileService {
     private static final boolean DBG = GattServiceConfig.DBG;
     private static final String TAG = GattServiceConfig.TAG_PREFIX + "GattService";
-    BluetoothAdapter mAdapter = BluetoothAdapter.getDefaultAdapter();
+    private static final int DEFAULT_SCAN_INTERVAL_MILLIS = 200;
+
+    /**
+     * Max packet size for ble advertising, defined in Bluetooth Specification Version 4.0 [Vol 3].
+     */
+    private static final int ADVERTISING_PACKET_MAX_BYTES = 31;
+    /**
+     * Size overhead for advertising flag.
+     */
+    private static final int ADVERTISING_FLAGS_BYTES = 3;
+    /**
+     * Size overhead per field. Usually it's just one byte of field length and one byte of
+     * field type.
+     */
+    private static final int FIELD_OVERHEAD_BYTES = 2;
+
+    /**
+     * Byte size of 16 bit service uuid.
+     */
+    private static final int SHORT_UUID_BYTES = 2;
+    /**
+     * Byte size of 128 bit service uuid.
+     */
+    private static final int FULL_UUID_BYTES = 16;
 
     /**
      * Search queue to serialize remote onbject inspection.
@@ -75,7 +102,14 @@ public class GattService extends ProfileService {
      * Server handle map.
      */
     HandleMap mHandleMap = new HandleMap();
+    private List<UUID> mAdvertisingServiceUuids = new ArrayList<UUID>();
 
+    private int mAdvertisingClientIf = 0;
+
+    private byte[] mServiceData = new byte[0];
+    private int mManufacturerCode = -1;
+    private byte[] mManufacturerData = new byte[0];
+    private boolean mIsAdvertising = false;
     /**
      * Pending service declaration queue
      */
@@ -112,7 +146,7 @@ public class GattService extends ProfileService {
     }
 
     /**
-     * List of clients intereste in scan results.
+     * List of clients interested in scan results.
      */
     private List<ScanClient> mScanQueue = new ArrayList<ScanClient>();
 
@@ -127,7 +161,7 @@ public class GattService extends ProfileService {
 
     private void removeScanClient(int appIf, boolean isServer) {
         for(ScanClient client : mScanQueue) {
-            if (client.appIf == appIf && client.isServer == isServer) {
+          if (client.appIf == appIf && client.isServer == isServer) {
                 mScanQueue.remove(client);
                 break;
             }
@@ -197,7 +231,11 @@ public class GattService extends ProfileService {
 
         public void binderDied() {
             if (DBG) Log.d(TAG, "Binder is dead - unregistering client (" + mAppIf + ")!");
-            stopScan(mAppIf, false);
+            if (mAdvertisingClientIf == mAppIf) {
+                stopAdvertising();
+            } else {
+                stopScan(mAppIf, false);
+            }
             unregisterClient(mAppIf);
         }
     }
@@ -412,11 +450,11 @@ public class GattService extends ProfileService {
 
         public void beginServiceDeclaration(int serverIf, int srvcType,
                                             int srvcInstanceId, int minHandles,
-                                            ParcelUuid srvcId) {
+                                            ParcelUuid srvcId, boolean advertisePreferred) {
             GattService service = getService();
             if (service == null) return;
             service.beginServiceDeclaration(serverIf, srvcType, srvcInstanceId,
-                               minHandles, srvcId.getUuid());
+                               minHandles, srvcId.getUuid(), advertisePreferred);
         }
 
         public void addIncludedService(int serverIf, int srvcType,
@@ -479,13 +517,68 @@ public class GattService extends ProfileService {
                 srvcId.getUuid(), charInstanceId, charId.getUuid(), confirm, value);
         }
 
-        public void setAdvData(int serverIf, boolean setScanRsp, boolean inclName,
-                                boolean inclTxPower, int minInterval, int maxInterval,
-                                int appearance, byte[] manufacturerData) {
+        @Override
+        public void startAdvertising(int appIf) throws RemoteException {
             GattService service = getService();
             if (service == null) return;
-            service.setAdvData(serverIf, setScanRsp, inclName, inclTxPower,
-                minInterval, maxInterval, appearance, manufacturerData);
+            service.startAdvertising(appIf);
+        }
+
+        @Override
+        public boolean isAdvertising() {
+            GattService service = getService();
+            if (service == null) return false;
+            return service.isAdvertising();
+        }
+
+        @Override
+        public void stopAdvertising() throws RemoteException {
+            GattService service = getService();
+            if (service == null) return;
+            service.stopAdvertising();
+        }
+
+        @Override
+        public boolean setAdvServiceData(byte[] serviceData) throws RemoteException {
+            GattService service = getService();
+            if (service == null) return false;
+            return service.setAdvServiceData(serviceData);
+        }
+
+        @Override
+        public byte[] getAdvServiceData() throws RemoteException {
+            GattService service = getService();
+            if (service == null) return null;
+            return service.getAdvServiceData();
+        }
+
+        @Override
+        public boolean setAdvManufacturerCodeAndData(int manufactureCode, byte[] manufacturerData)
+            throws RemoteException {
+            GattService service = getService();
+            if (service == null) return false;
+            return service.setAdvManufacturerCodeAndData(manufactureCode, manufacturerData);
+        }
+
+        @Override
+        public byte[] getAdvManufacturerData() throws RemoteException {
+            GattService service = getService();
+            if (service == null) return null;
+            return service.getAdvManufacturerData();
+        }
+
+        @Override
+        public List<ParcelUuid> getAdvServiceUuids() throws RemoteException {
+            GattService service = getService();
+            if (service == null) return null;
+            return service.getAdvServiceUuids();
+        }
+
+        @Override
+        public void removeAdvManufacturerCodeAndData(int manufacturerCode) throws RemoteException {
+            GattService service = getService();
+            if (service == null) return;
+            service.removeAdvManufacturerCodeAndData(manufacturerCode);
         }
     };
 
@@ -900,19 +993,12 @@ public class GattService extends ProfileService {
 
         if (DBG) Log.d(TAG, "startScan() - queue=" + mScanQueue.size());
 
-        if (getScanClient(appIf, isServer) == null &&
-            LeScanRequestArbitrator.instance().RequestLeScan(LeScanRequestArbitrator.LE_NORMAL_SCAN_TYPE)) {
+        if (getScanClient(appIf, isServer) == null) {
             if (DBG) Log.d(TAG, "startScan() - adding client=" + appIf);
             mScanQueue.add(new ScanClient(appIf, isServer));
-            if(mScanQueue.size()==1)//start scan only if it is not already started
-            {
-                gattClientScanNative(appIf, true);
-            }
-            else
-            {
-                Log.d(TAG, "startScan scan already in progress for appifs-queue=" + mScanQueue.size());
-            }
         }
+
+        gattClientScanNative(appIf, true);
     }
 
     void startScanWithUuids(int appIf, boolean isServer, UUID[] uuids) {
@@ -920,29 +1006,19 @@ public class GattService extends ProfileService {
 
         if (DBG) Log.d(TAG, "startScanWithUuids() - queue=" + mScanQueue.size());
 
-        if (getScanClient(appIf, isServer) == null &&
-            LeScanRequestArbitrator.instance().RequestLeScan(LeScanRequestArbitrator.LE_NORMAL_SCAN_TYPE)) {
+        if (getScanClient(appIf, isServer) == null) {
             if (DBG) Log.d(TAG, "startScanWithUuids() - adding client=" + appIf);
             mScanQueue.add(new ScanClient(appIf, isServer, uuids));
-            if(mScanQueue.size()==1)//start scan only if it is not already started
-            {
-                gattClientScanNative(appIf, true);
-            }
-            else
-            {
-                Log.d(TAG, "startScanWithUuids scan already in progress for appifs-queue=" + mScanQueue.size());
-            }
         }
+
+        gattClientScanNative(appIf, true);
     }
 
     void stopScan(int appIf, boolean isServer) {
         enforceCallingOrSelfPermission(BLUETOOTH_PERM, "Need BLUETOOTH_ADMIN permission");
 
         if (DBG) Log.d(TAG, "stopScan() - queue=" + mScanQueue.size());
-        if (getScanClient(appIf, isServer) != null) {
-            LeScanRequestArbitrator.instance().StopLeScan(LeScanRequestArbitrator.LE_NORMAL_SCAN_TYPE);
-            removeScanClient(appIf, isServer);
-        }
+        removeScanClient(appIf, isServer);
 
         if (mScanQueue.isEmpty()) {
             if (DBG) Log.d(TAG, "stopScan() - queue empty; stopping scan");
@@ -987,9 +1063,128 @@ public class GattService extends ProfileService {
         gattClientDisconnectNative(clientIf, address, connId != null ? connId : 0);
     }
 
-    void clientListen(int clientIf, boolean start) {
-        if (DBG) Log.d(TAG, "clientListen() - start=" + start);
-        gattClientListenNative(clientIf, start);
+    synchronized boolean setAdvServiceData(byte[] serviceData) {
+        enforcePrivilegedPermission();
+        if (serviceData == null) return false;
+        // Calculate how many more bytes are needed for advertising service data field.
+        int extraBytes = (mServiceData == null) ?
+                FIELD_OVERHEAD_BYTES + serviceData.length :
+                    serviceData.length - mServiceData.length;
+        if (getAvailableSize() < extraBytes) {
+            Log.e(TAG, "cannot set service data, available size " + getAvailableSize());
+            return false;
+        }
+        mServiceData = serviceData;
+        return true;
+    }
+
+    byte[] getAdvServiceData() {
+        enforcePrivilegedPermission();
+        return mServiceData;
+    }
+
+    synchronized boolean setAdvManufacturerCodeAndData(
+        int manufacturerCode, byte[] manufacturerData) {
+        enforcePrivilegedPermission();
+        if (manufacturerCode <= 0 || manufacturerData == null) {
+            return false;
+        }
+        if (mManufacturerCode > 0 && mManufacturerData != null) {
+            Log.e(TAG, "manufacture data is already set");
+            return false;
+        }
+        if (getAvailableSize() <
+            FIELD_OVERHEAD_BYTES + manufacturerData.length) {
+            Log.e(TAG, "cannot set manu data, available size " + getAvailableSize());
+            return false;
+        }
+        this.mManufacturerCode = manufacturerCode;
+        this.mManufacturerData = manufacturerData;
+        return true;
+    }
+
+    void removeAdvManufacturerCodeAndData(int manufacturerCode) {
+        enforcePrivilegedPermission();
+        if (mManufacturerCode != manufacturerCode) {
+            return;
+        }
+        mManufacturerCode = -1;
+        mManufacturerData = new byte[0];
+    }
+
+    byte[] getAdvManufacturerData() {
+        enforcePrivilegedPermission();
+        return mManufacturerData;
+    }
+
+    synchronized List<ParcelUuid> getAdvServiceUuids() {
+        enforcePrivilegedPermission();;
+        boolean fullUuidFound = false;
+        List<ParcelUuid> serviceUuids = new ArrayList<ParcelUuid>();
+        for (HandleMap.Entry entry : mHandleMap.mEntries) {
+            if (entry.advertisePreferred) {
+                ParcelUuid parcelUuid = new ParcelUuid(entry.uuid);
+                if (BluetoothUuid.isShortUuid(parcelUuid)) {
+                    serviceUuids.add(parcelUuid);
+                } else {
+                    // Allow at most one 128 bit service uuid to be advertised.
+                    if (!fullUuidFound) {
+                      fullUuidFound = true;
+                      serviceUuids.add(parcelUuid);
+                    }
+                }
+            }
+        }
+        return serviceUuids;
+    }
+
+    boolean isAdvertising() {
+        enforcePrivilegedPermission();
+        return mIsAdvertising;
+    }
+
+    void startAdvertising(int clientIf) {
+        enforcePrivilegedPermission();
+        if (DBG) Log.d(TAG, "start advertising for app - " + clientIf);
+        List<ParcelUuid> serviceUuids = getAdvServiceUuids();
+        int advertisingServiceUuidLength = serviceUuids == null ? 0 : serviceUuids.size();
+
+        // Note according to Bluetooth Spec Version 4.0, for advertising and scan response data
+        // "all numerical multi-byte entities and values shall use little-endian byte order".
+        ByteBuffer advertisingUuidBytes = ByteBuffer.allocate(advertisingServiceUuidLength * 16)
+                .order(ByteOrder.LITTLE_ENDIAN);
+        for (ParcelUuid parcelUuid : serviceUuids) {
+            UUID uuid = parcelUuid.getUuid();
+            // Least signifcant bits first as the advertising uuid should be in little-endian.
+            advertisingUuidBytes.putLong(uuid.getLeastSignificantBits())
+                    .putLong(uuid.getMostSignificantBits());
+        }
+
+        // Set advertising data.
+        gattSetAdvDataNative(clientIf,
+                false,  // not scan response data
+                false,  // no device name
+                false,  // no tx power included
+                DEFAULT_SCAN_INTERVAL_MILLIS,
+                DEFAULT_SCAN_INTERVAL_MILLIS,
+                0,  // no appearance limit
+                mManufacturerData,
+                mServiceData,
+                advertisingUuidBytes.array());
+
+        // Start advertising if advertising is not already started.
+        if (!isAdvertising()) {
+            gattAdvertiseNative(clientIf, true);
+            mAdvertisingClientIf = clientIf;
+            mIsAdvertising = true;
+        }
+    }
+
+    void stopAdvertising() {
+        enforcePrivilegedPermission();
+        gattAdvertiseNative(mAdvertisingClientIf, false);
+        mAdvertisingClientIf = 0;
+        mIsAdvertising = false;
     }
 
     List<String> getConnectedDevices() {
@@ -1183,8 +1378,11 @@ public class GattService extends ProfileService {
         UUID uuid = new UUID(srvcUuidMsb, srvcUuidLsb);
         if (DBG) Log.d(TAG, "onServiceAdded() UUID=" + uuid + ", status=" + status
             + ", handle=" + srvcHandle);
-        if (status == 0)
-            mHandleMap.addService(serverIf, srvcHandle, uuid, srvcType, srvcInstId);
+        if (status == 0) {
+            mHandleMap.addService(serverIf, srvcHandle, uuid, srvcType, srvcInstId,
+                mAdvertisingServiceUuids.remove(uuid));
+        }
+
         continueServiceDeclaration(serverIf, status, srvcHandle);
     }
 
@@ -1415,12 +1613,13 @@ public class GattService extends ProfileService {
     }
 
     void beginServiceDeclaration(int serverIf, int srvcType, int srvcInstanceId,
-                                 int minHandles, UUID srvcUuid) {
+                                 int minHandles, UUID srvcUuid, boolean advertisePreferred) {
         enforceCallingOrSelfPermission(BLUETOOTH_PERM, "Need BLUETOOTH permission");
 
         if (DBG) Log.d(TAG, "beginServiceDeclaration() - uuid=" + srvcUuid);
         ServiceDeclaration serviceDeclaration = addDeclaration();
-        serviceDeclaration.addService(srvcUuid, srvcType, srvcInstanceId, minHandles);
+        serviceDeclaration.addService(srvcUuid, srvcType, srvcInstanceId, minHandles,
+            advertisePreferred);
     }
 
     void addIncludedService(int serverIf, int srvcType, int srvcInstanceId,
@@ -1529,19 +1728,36 @@ public class GattService extends ProfileService {
         return type;
     }
 
+    private synchronized int getAvailableSize() {
+        enforcePrivilegedPermission();
+        int availableSize = ADVERTISING_PACKET_MAX_BYTES - ADVERTISING_FLAGS_BYTES;
+
+        for (ParcelUuid parcelUuid : getAdvServiceUuids()) {
+            if (BluetoothUuid.isShortUuid(parcelUuid)) {
+                availableSize -= FIELD_OVERHEAD_BYTES + SHORT_UUID_BYTES;
+            } else {
+                availableSize -= FIELD_OVERHEAD_BYTES + FULL_UUID_BYTES;
+            }
+        }
+        if (mManufacturerCode > 0 && mManufacturerData != null) {
+            availableSize -= (FIELD_OVERHEAD_BYTES + mManufacturerData.length);
+        }
+        if (mServiceData != null) {
+            availableSize -= (FIELD_OVERHEAD_BYTES + mServiceData.length);
+        }
+        return availableSize;
+    }
+
+    // Enforce caller has BLUETOOTH_PRIVILEGED permission. A {@link SecurityException} will be
+    // thrown if the caller app does not have BLUETOOTH_PRIVILEGED permission.
+    private void enforcePrivilegedPermission() {
+        enforceCallingOrSelfPermission(BLUETOOTH_PRIVILEGED,
+            "Need BLUETOOTH_PRIVILEGED permission");
+    }
+
     private void continueSearch(int connId, int status) throws RemoteException {
-        Log.d(TAG, "continueSearch() - connid=" + connId + ", status=" + status);
-
-        if(mSearchQueue.isEmpty())
-            Log.d(TAG,"Queue is completely empty");
-        if(mSearchQueue.isEmpty(connId))
-            Log.d(TAG,"continueSearch():Queue is empty for connid=" + connId);
-        if (status == 0 && !mSearchQueue.isEmpty(connId)) {
-            SearchQueue.Entry svc = mSearchQueue.pop(connId);
-
-            //verify once that the popped value is correct
-            if(svc.connId!=connId)
-                Log.d(TAG,"continueSearch(): connid of popped value not matching: input=" + connId + "and popped="+svc.connId);
+        if (status == 0 && !mSearchQueue.isEmpty()) {
+            SearchQueue.Entry svc = mSearchQueue.pop();
 
             if (svc.charUuidLsb == 0) {
                 // Characteristic is up next
@@ -1556,7 +1772,6 @@ public class GattService extends ProfileService {
         } else {
             ClientMap.App app = mClientMap.getByConnId(connId);
             if (app != null) {
-                Log.d(TAG,"continueSearch(): calling searchcomplete in frameworks");
                 app.callback.onSearchComplete(mClientMap.addressByConnId(connId), status);
             }
         }
@@ -1577,6 +1792,9 @@ public class GattService extends ProfileService {
                 + entry.type);
             switch(entry.type) {
                 case ServiceDeclaration.TYPE_SERVICE:
+                    if (entry.advertisePreferred) {
+                        mAdvertisingServiceUuids.add(entry.uuid);
+                    }
                     gattServerAddServiceNative(serverIf, entry.serviceType,
                         entry.instance,
                         entry.uuid.getLeastSignificantBits(),
@@ -1621,6 +1839,7 @@ public class GattService extends ProfileService {
             ServerMap.App app = mServerMap.getById(serverIf);
             if (app != null) {
                 HandleMap.Entry serviceEntry = mHandleMap.getByHandle(srvcHandle);
+
                 if (serviceEntry != null) {
                     app.callback.onServiceAdded(status, serviceEntry.serviceType,
                         serviceEntry.instance, new ParcelUuid(serviceEntry.uuid));
@@ -1801,11 +2020,11 @@ public class GattService extends ProfileService {
     private native void gattClientReadRemoteRssiNative(int clientIf,
             String address);
 
-    private native void gattClientListenNative(int client_if, boolean start);
+    private native void gattAdvertiseNative(int client_if, boolean start);
 
     private native void gattSetAdvDataNative(int serverIf, boolean setScanRsp, boolean inclName,
             boolean inclTxPower, int minInterval, int maxInterval,
-            int appearance, byte[] manufacturerData);
+            int appearance, byte[] manufacturerData, byte[] serviceData, byte[] serviceUuid);
 
     private native void gattServerRegisterAppNative(long app_uuid_lsb,
                                                     long app_uuid_msb);
