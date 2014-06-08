@@ -329,12 +329,6 @@ public class GattService extends ProfileService {
             service.clientDisconnect(clientIf, address);
         }
 
-        public void clientListen(int clientIf, boolean start) {
-            GattService service = getService();
-            if (service == null) return;
-            service.clientListen(clientIf, start);
-        }
-
         public void refreshDevice(int clientIf, String address) {
             GattService service = getService();
             if (service == null) return;
@@ -1411,15 +1405,6 @@ public class GattService extends ProfileService {
 
         if (DBG) Log.d(TAG, "readRemoteRssi() - address=" + address);
         gattClientReadRemoteRssiNative(clientIf, address);
-    }
-
-    void setAdvData(int serverIf, boolean setScanRsp, boolean inclName,
-                boolean inclTxPower, int minInterval, int maxInterval,
-                int appearance, byte[] manufacturerData) {
-        if (DBG) Log.d(TAG, "setAdvData() - setScanRsp=" + setScanRsp);
-        if (minInterval == 0) maxInterval = 0;
-        gattSetAdvDataNative(serverIf, setScanRsp, inclName, inclTxPower,
-            minInterval, maxInterval, appearance, manufacturerData);
     }
 
     /**************************************************************************
